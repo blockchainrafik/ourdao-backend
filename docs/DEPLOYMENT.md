@@ -187,6 +187,30 @@ Both the API and the worker maintain a pool of Postgres connections. They connec
 - **API**: stateless and horizontally scalable. Each instance maintains its own pool, sized via `DB_POOL_MAX` (default 10, `pg`'s own default made explicit). Pool size depends on expected *request* query concurrency only — `/api/stream` does **not** add to it: each instance keeps exactly one extra long-lived connection for its shared SSE listener, regardless of how many browser tabs are connected to that instance (issue #152 — a per-client connection here used to let ten concurrent streams alone exhaust the whole request pool).
 - **Total connections**: `worker_pool + (api_instances × (DB_POOL_MAX + 1))` must fit within Postgres's `max_connections` (the `+ 1` per instance is its stream listener). The default is 100; budget accordingly, or use a connection pooler (PgBouncer, RDS Proxy) if you scale API instances beyond a handful.
 
+### Multi-instance API state and PgBouncer
+
+Each API instance has its own `/api/stats` cache, nonce memory store (when
+`NONCE_STORE=memory`), SSE clients, and single long-lived stream listener.
+Postgres data and the default `NONCE_STORE=postgres` nonce store are shared.
+Consequently, cached stats from two instances can disagree for up to
+`STATS_CACHE_MS`, and stream socket limits apply independently to every
+instance.
+
+The stream listener uses Postgres `LISTEN`/`NOTIFY`, whose subscriptions belong
+to a database session. If PgBouncer is used, route the listener through
+**session pooling** (or directly to Postgres). Transaction pooling may assign a
+different server connection after `LISTEN` and silently lose notifications.
+Ordinary request-pool traffic can use transaction pooling; deployments that
+split the two paths should point the stream listener at the session-pooled or
+direct endpoint.
+
+For example, three API instances with `DB_POOL_MAX=10` and a worker pool of 5
+budget `5 + (3 × (10 + 1)) = 38` Postgres connections. They can accept up to
+`3 × STREAM_MAX_CONNECTIONS` SSE clients in total, subject to load-balancer
+distribution, while still using only three listener connections. With
+`NONCE_STORE=memory`, the same client could receive independent nonces from
+different instances; use `postgres` for this topology.
+
 The schema is applied idempotently by both processes on boot, serialized by a Postgres advisory lock. You do not need a separate migration step. Concurrent boots (e.g. a rolling deploy of the API alongside the worker restarting) are safe.
 
 ---
@@ -229,6 +253,19 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 ### The `events` log is append-only
 
 `events` rows are never mutated or deleted by normal operation. This is an architectural invariant, not just a convention — it is what makes `reindex` reliable. Do not write application code that modifies existing `events` rows. If an event was incorrectly decoded, fix the decoder and reindex; do not patch the raw row.
+
+### Notification retention and deletion
+
+`notifications` contains rendered, per-member convenience text derived from
+the event log. It is retained indefinitely today because there is no pruning
+job. This is an operational policy, not an audit requirement: only the raw,
+append-only `events` table is the durable audit record.
+
+Deletion of an exited member's notification history is currently unsupported.
+Deleting rows manually is also not durable: `npm run reindex` truncates all
+derived tables and regenerates every notification from `events`, including
+text previously removed. A future retention or member-deletion mechanism must
+apply the same policy during event replay before deletion can be promised.
 
 ---
 
